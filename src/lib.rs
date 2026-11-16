@@ -1,7 +1,10 @@
 pub mod backend;
 pub mod config;
+pub mod health;
 pub mod listener;
+pub mod metrics;
 pub mod proxy;
 pub mod registry;
 pub mod scheduler;
 pub mod server;
+pub mod shutdown;

@@ -1,5 +1,5 @@
-use std::net::SocketAddr;
 use crate::backend::Backend;
+use std::net::SocketAddr;
 mod algos;
 pub use algos::{Algorithm, Algos};
 

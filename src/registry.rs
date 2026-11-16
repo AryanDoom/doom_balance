@@ -1,6 +1,14 @@
-use crate::backend::Backend;
-#[derive(Debug, Default)]
+use std::{
+    net::SocketAddr,
+    sync::{Arc, RwLock},
+};
 
+use crate::backend::Backend;
+
+//the registry is shared between the accept loop (reads) and health checks (writes)
+pub type SharedRegistry = Arc<RwLock<BackendRegistry>>;
+
+#[derive(Debug, Default)]
 //this is the struct that holds the backend list and does fucntions related to it
 pub struct BackendRegistry {
     backend_list: Vec<Backend>,
@@ -29,6 +37,14 @@ impl BackendRegistry {
     //removes backend
     pub fn all_backends(&self) -> &[Backend] {
         &self.backend_list
+    }
+
+    //a cheap copy of the id/address/health so health checks can probe without holding the lock
+    pub fn health_snapshot(&self) -> Vec<(String, SocketAddr, bool)> {
+        self.backend_list
+            .iter()
+            .map(|backend| (backend.id.clone(), backend.address, backend.is_healthy))
+            .collect()
     }
     //basically sets the health of the server based on the id and health check
     pub fn set_backend_health(&mut self, backend_id: &str, is_healthy: bool) -> bool {
