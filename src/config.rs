@@ -1,4 +1,9 @@
-use std::{fs, net::SocketAddr, path::Path, time::Duration};
+use std::{
+    fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use serde::Deserialize;
 
@@ -33,6 +38,13 @@ pub struct Config {
     pub algorithm: Algorithm,
     pub health_check: HealthCheckConfig,
     pub max_connections: Option<usize>,
+    pub sdn: SdnConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SdnConfig {
+    pub controller_socket: Option<PathBuf>,
+    pub control_listen: Option<PathBuf>,
 }
 
 //the raw shapes that come straight out of the TOML file
@@ -47,6 +59,14 @@ struct RawConfig {
     limits: RawLimits,
     #[serde(default)]
     backends: Vec<RawBackend>,
+    #[serde(default)]
+    sdn: RawSdn,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawSdn {
+    controller_socket: Option<PathBuf>,
+    control_listen: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,6 +127,7 @@ impl Config {
             algorithm: Algorithm::RoundRobin,
             health_check: HealthCheckConfig::default(),
             max_connections: None,
+            sdn: SdnConfig::default(),
         }
     }
 
@@ -163,6 +184,10 @@ impl Config {
                 timeout: Duration::from_secs(raw_config.health_check.timeout_secs),
             },
             max_connections: raw_config.limits.max_connections,
+            sdn: SdnConfig {
+                controller_socket: raw_config.sdn.controller_socket,
+                control_listen: raw_config.sdn.control_listen,
+            },
         };
 
         config.validate()?;
@@ -174,6 +199,14 @@ impl Config {
     pub fn validate(&self) -> Result<(), String> {
         if self.backends.is_empty() {
             return Err("add at least one backend before starting the load balancer".to_owned());
+        }
+
+        if let (Some(controller_socket), Some(control_listen)) =
+            (&self.sdn.controller_socket, &self.sdn.control_listen)
+        {
+            if controller_socket == control_listen {
+                return Err("sdn.controller_socket and sdn.control_listen must differ".to_owned());
+            }
         }
 
         for backend_index in 0..self.backends.len() {

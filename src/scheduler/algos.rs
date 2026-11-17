@@ -359,4 +359,43 @@ mod tests {
             assert_ne!(algos.select(&backends, test_client_address()).unwrap(), 1);
         }
     }
+
+    #[test]
+    fn active_connection_count_returns_to_zero_when_guard_drops() {
+        let backend = backend("a", 9001);
+
+        {
+            let _connection = backend.start_connection();
+            assert_eq!(backend.active_connection_count(), 1);
+        }
+
+        assert_eq!(backend.active_connection_count(), 0);
+    }
+
+    #[test]
+    fn least_connections_skips_unhealthy_backends() {
+        let algos = Algos::new(Algorithm::LeastConnections);
+        let mut backends = vec![backend("busy-but-healthy", 9001), backend("down", 9002)];
+        let _busy_connection = backends[0].start_connection();
+        backends[1].is_healthy = false;
+
+        assert_eq!(algos.select(&backends, test_client_address()), Some(0));
+    }
+
+    #[test]
+    fn ip_hash_skips_unhealthy_backends() {
+        let algos = Algos::new(Algorithm::IpHash);
+        let mut backends = vec![backend("a", 9001), backend("b", 9002)];
+
+        for healthy_index in 0..backends.len() {
+            for (backend_index, backend) in backends.iter_mut().enumerate() {
+                backend.is_healthy = backend_index == healthy_index;
+            }
+
+            assert_eq!(
+                algos.select(&backends, test_client_address()),
+                Some(healthy_index)
+            );
+        }
+    }
 }

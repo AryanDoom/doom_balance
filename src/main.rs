@@ -4,6 +4,8 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
+use balance_this_load::sdn::{bind_control_socket, spawn_control_server, SdnClient};
 use balance_this_load::{
     config::Config,
     health,
@@ -47,6 +49,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let backend_registry: SharedRegistry = Arc::new(RwLock::new(backend_registry));
+
+    #[cfg(unix)]
+    let sdn_client: Option<Arc<SdnClient>> = match config.sdn.controller_socket.as_ref() {
+        Some(path) => {
+            let client = SdnClient::connect(path.clone()).await.map_err(|error| {
+                config_error(format!("failed to connect to sdn controller: {error}"))
+            })?;
+            info!(socket = %path.display(), "connected to sdn controller");
+            Some(Arc::new(client))
+        }
+        None => None,
+    };
+
+    #[cfg(unix)]
+    let sdn_task = match config.sdn.control_listen.as_ref() {
+        Some(path) => {
+            let client = sdn_client.as_ref().ok_or_else(|| {
+                config_error("sdn.control_listen requires sdn.controller_socket".to_owned())
+            })?;
+            let listener = bind_control_socket(path).await.map_err(|error| {
+                config_error(format!("failed to bind sdn control socket: {error}"))
+            })?;
+            info!(socket = %path.display(), "sdn control socket ready");
+            Some(spawn_control_server(
+                listener,
+                Arc::clone(&backend_registry),
+                Arc::clone(client),
+            ))
+        }
+        None => None,
+    };
+
     let scheduler: Arc<dyn Scheduler> = Arc::new(Algos::new(algorithm));
     let metrics = Arc::new(Metrics::new());
 
@@ -88,6 +122,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     health_task.abort();
     metrics_task.abort();
     shutdown_task.abort();
+    #[cfg(unix)]
+    if let Some(sdn_task) = sdn_task {
+        sdn_task.abort();
+    }
 
     info!(metrics = %metrics.snapshot(), "final metrics");
 

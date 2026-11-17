@@ -5,8 +5,8 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    listener::ClientListener, metrics::Metrics, proxy::handle_client_connection,
-    registry::SharedRegistry, scheduler::Scheduler,
+    connection::ConnectionGuard, listener::ClientListener, metrics::Metrics,
+    proxy::handle_client_connection, registry::SharedRegistry, scheduler::Scheduler,
 };
 
 //how long we let active connections finish after shutdown is requested
@@ -19,7 +19,28 @@ pub async fn run_load_balancer(
     scheduler: Arc<dyn Scheduler>,
     metrics: Arc<Metrics>,
     max_connections: Option<usize>,
+    shutdown_receiver: watch::Receiver<bool>,
+) -> io::Result<()> {
+    run_load_balancer_with_grace(
+        client_listener,
+        backend_registry,
+        scheduler,
+        metrics,
+        max_connections,
+        shutdown_receiver,
+        SHUTDOWN_GRACE,
+    )
+    .await
+}
+
+pub async fn run_load_balancer_with_grace(
+    client_listener: ClientListener,
+    backend_registry: SharedRegistry,
+    scheduler: Arc<dyn Scheduler>,
+    metrics: Arc<Metrics>,
+    max_connections: Option<usize>,
     mut shutdown_receiver: watch::Receiver<bool>,
+    shutdown_grace: Duration,
 ) -> io::Result<()> {
     let mut connections: JoinSet<()> = JoinSet::new();
     let mut listener_error: Option<io::Error> = None;
@@ -92,14 +113,13 @@ pub async fn run_load_balancer(
                 );
 
                 //each client gets its own task so the listener can keep accepting more clients
-                let task_metrics = Arc::clone(&metrics);
+                let mut connection_guard =
+                    ConnectionGuard::new(active_connection_guard, Arc::clone(&metrics));
                 connections.spawn(async move {
                     //this gets dropped when the connection task ends, which lowers the active count
-                    let _active_connection_guard = active_connection_guard;
-
                     match handle_client_connection(client_stream, backend_address).await {
                         Ok((bytes_to_backend, bytes_to_client)) => {
-                            task_metrics.connection_finished(bytes_to_backend, bytes_to_client);
+                            connection_guard.finish(bytes_to_backend, bytes_to_client);
                             debug!(
                                 client = %client_address,
                                 backend = %backend_address,
@@ -109,7 +129,7 @@ pub async fn run_load_balancer(
                             );
                         }
                         Err(proxy_error) => {
-                            task_metrics.connection_failed();
+                            connection_guard.fail();
                             warn!(
                                 client = %client_address,
                                 backend = %backend_address,
@@ -129,7 +149,7 @@ pub async fn run_load_balancer(
     );
 
     //wait for active connections, but do not hang forever on long-lived ones
-    let grace_deadline = tokio::time::sleep(SHUTDOWN_GRACE);
+    let grace_deadline = tokio::time::sleep(shutdown_grace);
     tokio::pin!(grace_deadline);
 
     loop {

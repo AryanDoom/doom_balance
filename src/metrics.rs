@@ -14,7 +14,9 @@ use tracing::info;
 pub struct Metrics {
     accepted: AtomicU64,
     active: AtomicU64,
+    finished: AtomicU64,
     failed: AtomicU64,
+    aborted: AtomicU64,
     rejected: AtomicU64,
     bytes_client_to_backend: AtomicU64,
     bytes_backend_to_client: AtomicU64,
@@ -34,6 +36,7 @@ impl Metrics {
     //called after copy_bidirectional finishes normally
     pub fn connection_finished(&self, bytes_to_backend: u64, bytes_to_client: u64) {
         self.active.fetch_sub(1, Ordering::Relaxed);
+        self.finished.fetch_add(1, Ordering::Relaxed);
         self.bytes_client_to_backend
             .fetch_add(bytes_to_backend, Ordering::Relaxed);
         self.bytes_backend_to_client
@@ -44,6 +47,11 @@ impl Metrics {
     pub fn connection_failed(&self) {
         self.active.fetch_sub(1, Ordering::Relaxed);
         self.failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn connection_aborted(&self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+        self.aborted.fetch_add(1, Ordering::Relaxed);
     }
 
     //called when a client is dropped before proxying (limit reached or no healthy backend)
@@ -59,7 +67,9 @@ impl Metrics {
         MetricsSnapshot {
             accepted: self.accepted.load(Ordering::Relaxed),
             active: self.active.load(Ordering::Relaxed),
+            finished: self.finished.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
+            aborted: self.aborted.load(Ordering::Relaxed),
             rejected: self.rejected.load(Ordering::Relaxed),
             bytes_client_to_backend: self.bytes_client_to_backend.load(Ordering::Relaxed),
             bytes_backend_to_client: self.bytes_backend_to_client.load(Ordering::Relaxed),
@@ -71,7 +81,9 @@ impl Metrics {
 pub struct MetricsSnapshot {
     pub accepted: u64,
     pub active: u64,
+    pub finished: u64,
     pub failed: u64,
+    pub aborted: u64,
     pub rejected: u64,
     pub bytes_client_to_backend: u64,
     pub bytes_backend_to_client: u64,
@@ -81,10 +93,12 @@ impl fmt::Display for MetricsSnapshot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "accepted={} active={} failed={} rejected={} bytes_client_to_backend={} bytes_backend_to_client={}",
+            "accepted={} active={} finished={} failed={} aborted={} rejected={} bytes_client_to_backend={} bytes_backend_to_client={}",
             self.accepted,
             self.active,
+            self.finished,
             self.failed,
+            self.aborted,
             self.rejected,
             self.bytes_client_to_backend,
             self.bytes_backend_to_client
