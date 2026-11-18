@@ -1,86 +1,111 @@
 # balance_this_load
 
-A small TCP load balancer written in Rust as a learning project. Clients connect to one listening port, the load balancer picks a backend application server, and bytes are forwarded in both directions without being parsed or modified.
+I started this as my own project idea because I wanted to understand how a load balancer works by building a small one myself. It later became part of my CN mini project, but the idea came from me first.
 
-The point of the project is to build each part ourselves — listener, backend registry, schedulers, health checks, proxy loop, metrics, shutdown — instead of configuring an existing tool such as NGINX.
+`balance_this_load` is a TCP load balancer written in Rust. A client connects to one address, the balancer picks an available backend, and then passes the TCP data between them. I built it in small modules so I could learn what each part does instead of setting up an existing tool like NGINX.
 
-## Scope
+## What it does
 
-- **Transport:** TCP only. The load balancer is protocol-agnostic: HTTP, Redis, a database protocol, or a custom echo protocol all work because payloads are never inspected.
-- **UDP:** not implemented. UDP is a scope question for the mentor/reviewer. It is not a flag on this code: datagrams have no `accept`/connection, so scheduling, affinity, and idle expiry would need a separate design.
-- **Mininet and SDN:** explicitly deferred to a later phase (see [Review deliverables](#review-deliverables)).
+- Accepts TCP connections from clients.
+- Picks a healthy backend with one of five scheduling algorithms.
+- Opens a TCP connection to that backend and copies data in both directions.
+- Checks whether backends are accepting TCP connections.
+- Tracks connection outcomes and bytes sent in each direction.
+- Runs in a Mininet topology and can send backend block/unblock commands to a POX SDN controller.
 
-## Network architecture
+This is TCP only. It does not parse HTTP, terminate TLS, or change the data being sent. UDP is not implemented; it would need a separate design because UDP has datagrams instead of accepted TCP connections.
 
+## How a request moves
+
+```text
+client
+  |
+  | TCP
+  v
+load balancer listener
+  |
+  v
+scheduler picks a healthy backend
+  |
+  | TCP
+  v
+backend application
 ```
-   clients                              balance_this_load                          backends
-+-----------+   TCP     +------------------------------------------+   TCP     +-------------------+
-| curl /    | --------> | ClientListener::accept_client            | --------> | 127.0.0.1:9001    |
-| test app  |           |            |                             |           | application 1     |
-+-----------+           |            v                             |           +-------------------+
-                        | Scheduler::select (healthy backends)     |
-                        |            |                             |   TCP     +-------------------+
-                        |            v                             | --------> | 127.0.0.1:9002    |
-                        | proxy::copy_bidirectional                |           | application 2     |
-                        +------------------------------------------+           +-------------------+
-                              ^                        ^
-                              |                        |
-                   health::run (every 5s)      metrics reporter (every 15s)
-                   TCP connect probes          counters + tracing logs
-```
 
-One listener accepts clients. For every accepted connection the scheduler returns a backend index, and a dedicated Tokio task connects to that backend and copies bytes in both directions. Health checks and metrics run as separate background tasks and share state through `Arc<RwLock<BackendRegistry>>` and atomic counters.
+The load balancer runs a task for each client connection, so one slow connection does not stop it from accepting others. The proxy copies bytes both ways and carries TCP half-closes through. It does not reuse backend connections: each client connection gets a new one.
 
-## Components
+## Network setup
 
-| Module | Responsibility |
+The Mininet demo has four hosts on one OpenFlow UserSwitch:
+
+| Host | Address | Role |
+| --- | --- | --- |
+| h1 | `10.0.0.1` | Sends test requests |
+| h2 | `10.0.0.2` | Runs the Rust load balancer on port `8080` |
+| h3 | `10.0.0.3` | Backend on port `9000` |
+| h4 | `10.0.0.4` | Backend on port `9000` |
+
+POX controls the switch over OpenFlow 1.0. The basic tests use POX's learning-switch app. The SDN test uses my custom POX app, which installs explicit forwarding rules and can block or unblock a backend IP. Rust still chooses the backend; POX controls whether the network can reach it.
+
+The Mininet runs are done in Fedora WSL. The Windows checkout is the main copy, and `sdn/capture_evidence_wsl.sh` syncs it into the WSL copy before running the checks.
+
+## Code layout
+
+| File or module | What it does |
 | --- | --- |
-| `src/main.rs` | Loads the TOML config, initializes logging, wires registry/scheduler/listener/metrics/health/shutdown together. |
-| `src/config.rs` | TOML schema, file loading, defaults, validation (unique ids, non-empty backends, sane limits). |
-| `src/backend.rs` | Backend identity, address, weight, health flag, and an RAII guard for active connection counting. |
-| `src/registry.rs` | Owns the backend list; `SharedRegistry = Arc<RwLock<BackendRegistry>>` for accept-loop reads and health-check writes. |
-| `src/scheduler/mod.rs` | `Scheduler` trait: `select(&[Backend], client_address) -> Option<usize>`. |
-| `src/scheduler/algos.rs` | Round robin, weighted round robin, least connections, IP hash, random; unit tests. |
-| `src/listener.rs` | Binds and accepts TCP client connections. |
-| `src/proxy.rs` | Opens the backend TCP connection and runs `copy_bidirectional`, returning byte counts. |
-| `src/server.rs` | Accept loop, per-client tasks, connection limit, graceful drain on shutdown, connection accounting. |
-| `src/health.rs` | Background TCP connect probes; flips `is_healthy` and logs transitions. |
-| `src/metrics.rs` | Atomic counters, snapshots, periodic metrics logging. |
-| `src/shutdown.rs` | `watch` channel plus ctrl-c handling; one shared stop flag. |
-| `tests/config.rs` | Config parsing, defaults, and rejection cases. |
-| `tests/load_balancer.rs` | End-to-end traffic, distribution, health, limit, and cleanup tests with real TCP echo backends. |
-
-## Protocols and socket behavior
-
-- **Client to load balancer:** plain TCP. The client connects to the configured `listen` address.
-- **Load balancer to backend:** one fresh TCP connection per client connection (no pooling). On connect failure the client is dropped, the failure is counted in `failed`, and the accept loop keeps running.
-- **Data forwarding:** `tokio::io::copy_bidirectional` copies both directions concurrently and handles TCP half-closes. Bytes are never decoded, so protocol-level routing is not possible by design.
-- **Health checks:** every interval the balancer attempts a TCP connect with a timeout. Success means healthy, failure means unhealthy. This checks reachability, not application-level readiness (no HTTP status or query probe).
-- **Selection:** schedulers only consider backends with `is_healthy == true`. Existing connections are unaffected when a backend becomes unhealthy; only new selections change.
-- **Graceful shutdown:** ctrl-c flips a `watch` flag. The accept loop stops, active connections get up to 10 seconds to finish, then remaining tasks are aborted.
-- **Limits:** when `limits.max_connections` is set, a client accepted while `active >= limit` is dropped immediately and counted in `rejected`.
+| `src/main.rs` | Loads the config and starts the balancer parts. |
+| `src/config.rs` | Reads and checks the TOML config. |
+| `src/backend.rs` | Stores a backend's address, weight, health, and active connection count. |
+| `src/registry.rs` | Holds the backend list used by the listener and health checks. |
+| `src/scheduler/algos.rs` | Has the five backend selection algorithms. |
+| `src/listener.rs` | Binds the TCP listen address and accepts clients. |
+| `src/server.rs` | Runs the accept loop and starts a task for each connection. |
+| `src/proxy.rs` | Connects to the backend and copies data both directions. |
+| `src/connection.rs` | Cleans up connection counts and metrics when a connection ends. |
+| `src/health.rs` | Probes backends and updates their healthy/unhealthy state. |
+| `src/metrics.rs` | Tracks counters and writes metric snapshots to the logs. |
+| `src/shutdown.rs` | Stops accepting clients and gives active connections time to finish. |
+| `src/sdn.rs` | Sends Rust control commands to the POX controller over Unix sockets. |
+| `sdn/controller/lb_controller.py` | POX app for explicit switch rules and backend blocking. |
+| `sdn/run_*.py` | Mininet test scripts for connectivity, algorithms, health, and SDN. |
 
 ## Scheduling algorithms
 
-| Config value | Behavior |
+The scheduler only considers healthy backends.
+
+| Config name | What it does |
 | --- | --- |
-| `round_robin` | Cycles through healthy backends in order. |
-| `weighted_round_robin` | Repeats each healthy backend according to its `weight`. |
-| `least_connections` | Picks the healthy backend with the fewest active connections; ties rotate. |
-| `ip_hash` | Hashes the client IP so the same client IP sticks to the same healthy backend. |
+| `round_robin` | Takes the next healthy backend in order. |
+| `weighted_round_robin` | Sends more connections to backends with a higher weight. |
+| `least_connections` | Picks the healthy backend with the fewest active connections. Ties rotate. |
+| `ip_hash` | Hashes the client's IP so the same IP keeps landing on the same backend while the healthy set stays the same. |
 | `random` | Picks a random healthy backend. |
 
-Weights are only used by `weighted_round_robin`.
+Only weighted round robin uses the backend weights.
+
+## Health checks, metrics, and logs
+
+Health checks try to open a TCP connection to each backend. A successful connection marks it healthy; a failed or timed-out connection marks it unhealthy. The default interval is five seconds. The health test uses a one-second interval so failure and recovery are quicker to show.
+
+This check only tells us whether something accepts a TCP connection. It does not send an HTTP request or prove that the application can answer correctly. When a backend goes down, existing connections can fail, but new connections avoid that backend. When it comes back, it can be selected again.
+
+The metrics module tracks accepted, active, finished, failed, aborted, and rejected connections, plus bytes from client to backend and backend to client. It logs a snapshot every 15 seconds and a final snapshot at shutdown. Metrics are not saved to a database or exposed through Prometheus.
+
+## SDN control
+
+The custom POX app installs destination-IP forwarding rules and an ARP flood rule when the switch connects. It also listens on a Unix socket for:
+
+| Command | Result |
+| --- | --- |
+| `STATUS` | Shows the backend IPs currently blocked by the controller. |
+| `BLOCK <ip>` | Installs drop rules for that backend IP. |
+| `UNBLOCK <ip>` | Removes the drop rules for that backend IP. |
+
+When the optional `[sdn]` config is set, Rust connects to POX and opens its own control socket. Rust accepts `BLOCK <backend-id-or-ip>`, `UNBLOCK <backend-id-or-ip>`, and `STATUS`, then forwards the command to POX. This bridge uses Unix sockets, so it is used in the Linux/WSL demo.
 
 ## Configuration
 
-The binary takes an optional config path (default: `config.toml`):
-
-```bash
-cargo run -- config.toml
-```
-
-Example (`config.toml` in the repo root):
+The program reads `config.toml` by default. You can pass a different file as the first argument.
 
 ```toml
 listen = "127.0.0.1:8080"
@@ -105,184 +130,122 @@ address = "127.0.0.1:9002"
 weight = 2
 ```
 
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `listen` | required | Address the load balancer binds. |
-| `algorithm` | `round_robin` | One of the five scheduler names. |
-| `health_check.enabled` | `true` | Enable background TCP probes. |
-| `health_check.interval_secs` | `5` | Seconds between probe rounds (must be >= 1). |
-| `health_check.timeout_secs` | `1` | Per-probe connect timeout (must be >= 1). |
-| `limits.max_connections` | unset | Maximum simultaneous proxied connections; omitted means unlimited. |
-| `backends[].id` | required | Unique backend name (also used in logs). |
-| `backends[].address` | required | Backend `ip:port`. |
-| `backends[].weight` | `1` | Weight for weighted round robin (must be >= 1). |
+For the Mininet run, the matching config is `sdn/config_mininet.toml`. The `[sdn]` section is optional; leave it out for normal local use.
 
-## Running locally
+## Run it locally
+
+Build the project:
 
 ```bash
-# 1. Build
 cargo build --release
-
-# 2. Start two simple backends (any TCP service works; HTTP is convenient)
-python -m http.server 9001
-python -m http.server 9002     # in a second terminal
-
-# 3. Start the load balancer
-cargo run --release -- config.toml
-
-# 4. Send requests; round robin should alternate backends
-curl http://127.0.0.1:8080/
-curl http://127.0.0.1:8080/
 ```
 
-Logging uses `tracing` with an environment filter:
+Start two TCP backends in separate terminals. The included echo server is handy for checking the proxy:
 
 ```bash
-RUST_LOG=debug cargo run -- config.toml
+python sdn/echo_backend.py 127.0.0.1 9001
+python sdn/echo_backend.py 127.0.0.1 9002
 ```
 
-At startup the balancer logs its listen address, algorithm, backend count, limit, and health-check state. Every 15 seconds it logs a metrics line; a final metrics line is written at shutdown.
-
-## Testing
-
-Automated tests:
+Start the balancer in another terminal:
 
 ```bash
-cargo test
-cargo clippy --all-targets
+RUST_LOG=info cargo run --release -- config.toml
+```
+
+Then connect a test client to `127.0.0.1:8080`. For example, the echo client can send five connections:
+
+```bash
+python sdn/echo_client.py 127.0.0.1 8080 5 local-test
+```
+
+## Tests and results
+
+Run the Rust checks with:
+
+```bash
 cargo fmt --check
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
 ```
 
-Current suite (24 tests):
+The captured run passed all 30 Rust tests, formatting, and Clippy. The Rust tests cover scheduler behavior, config validation, forwarding, health checks, connection limits, and cleanup.
 
-| Area | Test coverage |
+For the Mininet tests, open Fedora WSL and run:
+
+```bash
+bash /mnt/c/Code/balance_this_load/sdn/capture_evidence_wsl.sh
+```
+
+The script syncs the Windows repo into `/home/doom/balance_this_load`, builds the release binary, runs the Rust checks and Mininet scripts, and saves logs plus a report under `sdn/evidence/` in the WSL copy. Mininet uses `sudo` for its network setup.
+
+Latest captured Mininet results:
+
+| Check | Result |
 | --- | --- |
-| Schedulers | Round-robin order and unhealthy skipping, weighted distribution and unhealthy weights, least-connections choice and tie rotation, IP-hash stability, random healthy-only, all-down returns `None`. |
-| Config | Full parse, defaults, empty backend list, duplicate ids, zero weight, unknown algorithm, zero health settings, zero connection limit, file loading. |
-| Traffic path | Real echo backends: byte forwarding and metrics, round-robin split, weighted split, unhealthy backend skipped, health probe marks a dead backend down. |
-| Connection control | Limit rejection counted and first connection preserved; active count returns to zero after clients close. |
+| `pingall` | 0% loss; 12 of 12 pings received. |
+| Direct TCP echo | h1 reached h3 and h4; both echoed the test payload back. |
+| Round robin baseline | 8 client connections split 4/4 between h3 and h4. |
+| Round robin | 8 requests: h3 4, h4 4. |
+| Weighted round robin, weights 2:1 | 12 requests: h3 8, h4 4. |
+| Least connections | 8 requests: h3 4, h4 4. |
+| IP hash | 8 requests from the same client IP all went to h3. |
+| Random | 100 requests: h3 53, h4 47. |
+| Health failure | With h4 down, the next 8 requests went to h3; h4 got 0. |
+| Health recovery | After h4 restarted, it received new traffic again. |
+| SDN blocking | Blocking h4 stopped new traffic from reaching it; unblocking restored traffic. |
 
-Manual / exploratory checks:
+The scheduler script also reports the time for one sequential batch. Those measurements are rough and the batch sizes differ, so they are not a fair benchmark of which algorithm is fastest. The useful result here is the distribution: weighted round robin matched the configured 2:1 weights, while IP hash kept one client IP on one backend.
 
-1. Kill a backend while traffic is flowing: existing connections fail, health checks mark it unhealthy within the interval, new connections avoid it, and the logs show the transition.
-2. Start with a backend address where nothing is listening: startup still works, that backend is skipped once marked unhealthy.
-3. Set `max_connections = 1` and open a long-lived connection: the next client is dropped and `rejected` increases.
-4. Send SIGINT / ctrl-c: listener stops, active connections drain, final metrics are logged.
-5. Compare schedulers by running the same request pattern under each algorithm and watching per-backend hit counts.
+The Mininet run was on Fedora 44 in WSL2 with Mininet 2.3.1, POX 0.7.0, Python 3.14.7, and the UserSwitch datapath. POX warned that Python 3.14 is outside its listed supported versions, but it started and the tests completed. The scripts use a non-default switch DPID and turn off TX/GSO/TSO offload on the host links because both settings were needed for the UserSwitch TCP tests in this setup.
 
-## Evaluation and testing plan
+## Things I have not added
 
-For the review, evaluate in four layers:
+- UDP support
+- TLS termination
+- HTTP path or host routing
+- Backend connection pooling or retries
+- Prometheus export or persistent metric storage
+- More switches or automatic backend discovery in the SDN controller
 
-| Layer | What to measure | Suggested method |
-| --- | --- | --- |
-| Functional correctness | Requests reach a backend unchanged; chosen backend matches the algorithm; health and limits behave as configured. | `cargo test` plus the manual checks above. |
-| Traffic distribution | Per-backend request/connection share under each scheduler; weight ratios for weighted round robin. | Count backend accept logs while sending N requests/connections; compare against expected shares. |
-| Failure behavior | Time to mark a dead backend unhealthy, new-connection avoidance, existing-connection errors, recovery when it returns. | Kill/restart a backend during a traffic run; inspect health transition logs and metrics. |
-| Load and limits | Throughput, active connection count, rejection behavior at the limit, memory/task stability. | `wrk -t4 -c100 -d30s http://127.0.0.1:8080/` or `ab`; `iperf3` for raw TCP; watch metrics lines. |
+Those are possible next steps, but they are not part of the current project.
 
-Acceptance criteria used in this repo:
+## Project files
 
-- Traffic is byte-for-byte unchanged in both directions.
-- No healthy backend is ever selected; no unhealthy backend receives new connections.
-- `accepted = successful + failed + still active` stays consistent, and `active` returns to zero after all clients disconnect.
-- A failing backend or client never stops the accept loop.
-- The balancer shuts down on ctrl-c without corrupting counters, draining or aborting connections within a bounded time.
-
-For a later network-focused evaluation, the same balancer can sit between Mininet hosts, with SDN rules used to block or redirect paths and logs/metrics compared against the baseline.
-
-## Review deliverables
-
-| Deliverable | Status | Location |
-| --- | --- | --- |
-| Network architecture | Done | diagram and data-path text above |
-| Component explanations | Done | Components table and module docs |
-| Protocol/socket explanations | Done | Protocols and socket behavior section |
-| TCP load balancer implementation | Done | `src/`, runnable with `config.toml` |
-| Evaluation and testing plan | Done | sections above |
-| Viva preparation | Done | Q&A below |
-| Mininet implementation | Deferred | later phase |
-| SDN implementation | Deferred | later phase |
-| Socket–SDN integration | Deferred | later phase |
-| UDP socket support | Open scope question | TCP-only today; discuss with mentor |
-
-## Viva preparation
-
-**Why a TCP proxy instead of an HTTP reverse proxy?**
-It is protocol-agnostic and shows the socket-level mechanics: accept, backend connect, bidirectional copy, half-close, limits, and health. HTTP routing would require parsing requests and would hide those fundamentals.
-
-**How does a backend get selected?**
-The `Scheduler` trait receives the backend list and client address and returns an index. Algorithms filter to healthy backends first; `server.rs` reserves an active-connection slot and spawns the proxy task.
-
-**Why one Tokio task per client?**
-The accept loop must stay free to accept new clients. Each task owns its streams and guard, so slow clients cannot block others.
-
-**What happens when a backend dies?**
-An in-flight connection fails and is counted as `failed`. Background probes mark the backend unhealthy, so new selections avoid it. When probes succeed again, it is marked healthy and receives new connections.
-
-**How are active connections counted accurately?**
-`Backend::start_connection` increments an `AtomicUsize` and returns an RAII guard; dropping the guard at task end decrements it. Least connections and metrics both read the same counter.
-
-**How does least connections break ties?**
-It collects all healthy backends with the minimum count and rotates through them with an atomic counter, so equal-load backends are used evenly.
-
-**How does IP hash work?**
-It hashes only the client IP (not the port) with `DefaultHasher` and maps the hash into the healthy backend list. The same client IP is sticky while the healthy set is unchanged; adding/removing a backend can remap it.
-
-**What is half-close and how is it handled?**
-TCP FIN can close one direction while the other stays open. `copy_bidirectional` propagates EOF per direction, so protocols that half-close still work.
-
-**How is the connection limit enforced?**
-Before proxying, the accept loop compares `metrics.active_connections()` with `max_connections`; at the limit it drops the accepted socket and increments `rejected`. There is no queueing.
-
-**How does graceful shutdown work?**
-A `watch` channel carries a stop flag; ctrl-c sets it. The accept loop is biased toward shutdown, stops accepting, gives active tasks 10 seconds, then aborts the rest and logs final metrics.
-
-**Why `RwLock` around the registry?**
-The accept loop only reads the backend list, while health checks write the health flag. `RwLock` allows concurrent reads and short exclusive writes; the lock is never held across an await.
-
-**Why are metrics atomic?**
-Every client task and the health task update counters concurrently. Atomics avoid a global mutex on the hot path; snapshots are eventually consistent.
-
-**Why is the health check only a TCP connect?**
-It is cheap, works for any TCP service, and answers "is something accepting connections?" It does not prove the application is ready to serve; an HTTP or protocol-specific probe would be the next step.
-
-**How would UDP change the design?**
-There is no accept or per-connection stream. A UDP balancer would receive datagrams, choose a backend per packet or per flow (with an affinity table and idle timeout), and send datagrams back to the client. That is why it is a separate design decision, not a config flag.
-
-**What is intentionally missing?**
-UDP, TLS termination, HTTP host/path routing, backend connection pooling, retries, weighted least connections, persistence of metrics, and Mininet/SDN integration.
-
-## Limitations and next steps
-
-- TCP connect probes cannot detect an application that accepts connections but returns errors.
-- Metrics are logged, not exported via Prometheus or an endpoint yet.
-- No retry means a connection to a just-died backend fails rather than trying another backend.
-- The IP-hash mapping is not consistent hashing, so a healthy-set change remaps many clients.
-- Next code milestone: configurable shutdown grace, structured log levels per module, and an HTTP-level mode or benchmark harness.
-- Next review milestone: Mininet topology, SDN baseline rules, and socket–SDN integration (deferred).
-
-## Project layout
-
-```
+```text
 Cargo.toml
 config.toml
 src/
   main.rs
-  lib.rs
   config.rs
   backend.rs
   registry.rs
   listener.rs
   proxy.rs
   server.rs
+  connection.rs
   health.rs
   metrics.rs
   shutdown.rs
+  sdn.rs
   scheduler/
     mod.rs
     algos.rs
 tests/
   config.rs
   load_balancer.rs
+sdn/
+  topo_lb.py
+  run_tests.py
+  run_lb_matrix.py
+  run_health_test.py
+  run_sdn_test.py
+  mininet_common.py
+  capture_evidence.py
+  capture_evidence_wsl.sh
+  config_mininet.toml
+  echo_backend.py
+  echo_client.py
+  controller/
+    lb_controller.py
 ```
