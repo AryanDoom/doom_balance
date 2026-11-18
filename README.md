@@ -1,6 +1,6 @@
 # balance_this_load
 
-I started this as my own project idea because I wanted to understand how a load balancer works by building a small one myself. It later became part of my CN mini project, but the idea came from me first.
+I started this as my own project idea because I wanted to understand how a load balancer works by building a small one myself. It later became part of my CN mini project (2 birds one stone typeshi)
 
 `balance_this_load` is a TCP load balancer written in Rust. A client connects to one address, the balancer picks an available backend, and then passes the TCP data between them. I built it in small modules so I could learn what each part does instead of setting up an existing tool like NGINX.
 
@@ -14,6 +14,8 @@ I started this as my own project idea because I wanted to understand how a load 
 - Runs in a Mininet topology and can send backend block/unblock commands to a POX SDN controller.
 
 This is TCP only. It does not parse HTTP, terminate TLS, or change the data being sent. UDP is not implemented; it would need a separate design because UDP has datagrams instead of accepted TCP connections.
+
+(All of this is supposed to be done if i dont get distracted fr)
 
 ## How a request moves
 
